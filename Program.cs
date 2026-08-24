@@ -18,7 +18,7 @@ app.UseWebSockets(new WebSocketOptions
 
 const string SECRET_KEY = "my_super_secret_discord_key";
 
-app.MapGet("/", () => "High-Performance UDP Relay Server is Running!");
+app.MapGet("/", () => "High-Performance UDP Relay Server is Running!!!");
 
 app.Map("/relay", async context =>
 {
