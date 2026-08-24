@@ -12,4 +12,4 @@ COPY --from=build /app/publish .
 ENV DOTNET_USE_POLLING_FILE_WATCHER=true
 ENV DOTNET_EnableDiagnostics=0
 
-ENTRYPOINT ["dotnet", "UdpRelayServer.dll"]
+ENTRYPOINT ["dotnet", "UdpRelayServer.dll"]  
