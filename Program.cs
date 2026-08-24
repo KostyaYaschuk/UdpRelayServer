@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
@@ -18,7 +19,23 @@ app.UseWebSockets(new WebSocketOptions
 
 const string SECRET_KEY = "my_super_secret_discord_key";
 
-app.MapGet("/", () => "High-Performance UDP Relay Server is Running!!!");
+app.MapGet("/", () => "High-Performance UDP Relay Server is Running!");
+
+// Эндпоинт метрик для мониторинга состояния Render
+app.MapGet("/stats", () =>
+{
+    var uptime = DateTime.UtcNow - ServerMetrics.StartTime;
+    return Results.Json(new
+    {
+        cpu = ServerMetrics.CpuUsagePercent,
+        ramMb = ServerMetrics.MemoryMb,
+        uptime = $"{(int)uptime.TotalHours:D2}:{uptime.Minutes:D2}:{uptime.Seconds:D2}",
+        packetsIn = ServerMetrics.PacketsInPerSec,
+        packetsOut = ServerMetrics.PacketsOutPerSec,
+        activeRelays = ServerMetrics.ActiveRelays,
+        cores = Environment.ProcessorCount
+    });
+});
 
 app.Map("/relay", async context =>
 {
@@ -38,6 +55,8 @@ app.Map("/relay", async context =>
     using var webSocket = await context.WebSockets.AcceptWebSocketAsync();
     using var udpClient = new UdpClient(0);
 
+    Interlocked.Increment(ref ServerMetrics.ActiveRelays);
+
     try
     {
         udpClient.Client.ReceiveBufferSize = 4 * 1024 * 1024;
@@ -50,7 +69,7 @@ app.Map("/relay", async context =>
     var toWsChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
     var toUdpChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
 
-    // Поток 1: Читаем UDP от Discord -> пишем в Channel
+    // Поток 1: UDP от Discord -> Channel
     var udpReceiveTask = Task.Run(async () =>
     {
         var remoteEp = new IPEndPoint(IPAddress.Any, 0);
@@ -73,6 +92,8 @@ app.Map("/relay", async context =>
                 buffer[5] = (byte)(remotePort & 0xFF);
 
                 int totalLen = 6 + result.ReceivedBytes;
+                Interlocked.Increment(ref ServerMetrics.TotalPacketsIn);
+
                 if (!toWsChannel.Writer.TryWrite(new RentedPacket(buffer, totalLen, null)))
                 {
                     ArrayPool<byte>.Shared.Return(buffer);
@@ -83,7 +104,7 @@ app.Map("/relay", async context =>
         }
     });
 
-    // Поток 2: Вычитываем Channel -> шлем в WebSocket
+    // Поток 2: Channel -> WebSocket
     var wsSendTask = Task.Run(async () =>
     {
         try
@@ -111,7 +132,7 @@ app.Map("/relay", async context =>
         catch { }
     });
 
-    // Поток 3: Читаем из WebSocket -> пишем в Channel для UDP
+    // Поток 3: WebSocket -> Channel
     var wsReceiveTask = Task.Run(async () =>
     {
         while (!cts.IsCancellationRequested && webSocket.State == WebSocketState.Open)
@@ -133,6 +154,8 @@ app.Map("/relay", async context =>
                     var targetPort = (ushort)((buffer[4] << 8) | buffer[5]);
                     var ep = new IPEndPoint(targetIp, targetPort);
 
+                    Interlocked.Increment(ref ServerMetrics.TotalPacketsOut);
+
                     if (!toUdpChannel.Writer.TryWrite(new RentedPacket(buffer, result.Count, ep)))
                     {
                         ArrayPool<byte>.Shared.Return(buffer);
@@ -147,7 +170,7 @@ app.Map("/relay", async context =>
         }
     });
 
-    // Поток 4: Вычитываем Channel -> шлем UDP в Discord
+    // Поток 4: Channel -> UDP в Discord
     var udpSendTask = Task.Run(async () =>
     {
         try
@@ -176,7 +199,6 @@ app.Map("/relay", async context =>
         catch { }
     });
 
-    // Ожидаем завершения приема с любой из сторон
     await Task.WhenAny(wsReceiveTask, udpReceiveTask);
     cts.Cancel();
 
@@ -184,6 +206,8 @@ app.Map("/relay", async context =>
     toUdpChannel.Writer.TryComplete();
 
     await Task.WhenAll(wsSendTask, udpSendTask);
+
+    Interlocked.Decrement(ref ServerMetrics.ActiveRelays);
 
     if (webSocket.State == WebSocketState.Open)
     {
@@ -208,5 +232,65 @@ public readonly struct RentedPacket
         Buffer = buffer;
         Length = length;
         EndPoint = endPoint;
+    }
+}
+
+public static class ServerMetrics
+{
+    private static TimeSpan _lastCpuTime;
+    private static DateTime _lastSampleTime = DateTime.UtcNow;
+    public static double CpuUsagePercent { get; private set; }
+    public static long MemoryMb { get; private set; }
+    public static DateTime StartTime { get; } = DateTime.UtcNow;
+    public static long TotalPacketsIn;
+    public static long TotalPacketsOut;
+    public static long PacketsInPerSec { get; private set; }
+    public static long PacketsOutPerSec { get; private set; }
+    public static int ActiveRelays;
+
+    private static long _lastPacketsIn;
+    private static long _lastPacketsOut;
+
+    static ServerMetrics()
+    {
+        var proc = Process.GetCurrentProcess();
+        _lastCpuTime = proc.TotalProcessorTime;
+        _lastSampleTime = DateTime.UtcNow;
+
+        _ = Task.Run(async () =>
+        {
+            while (true)
+            {
+                await Task.Delay(1000);
+                try
+                {
+                    var now = DateTime.UtcNow;
+                    var curCpu = proc.TotalProcessorTime;
+                    var timePassed = (now - _lastSampleTime).TotalMilliseconds;
+
+                    if (timePassed > 0)
+                    {
+                        var cpuUsed = (curCpu - _lastCpuTime).TotalMilliseconds;
+                        var totalAvail = timePassed * Environment.ProcessorCount;
+                        CpuUsagePercent = Math.Clamp(Math.Round((cpuUsed / totalAvail) * 100.0, 1), 0.0, 100.0);
+                    }
+
+                    _lastCpuTime = curCpu;
+                    _lastSampleTime = now;
+                    proc.Refresh();
+                    MemoryMb = proc.WorkingSet64 / (1024 * 1024);
+
+                    long curIn = Interlocked.Read(ref TotalPacketsIn);
+                    long curOut = Interlocked.Read(ref TotalPacketsOut);
+
+                    PacketsInPerSec = Math.Max(0, curIn - _lastPacketsIn);
+                    PacketsOutPerSec = Math.Max(0, curOut - _lastPacketsOut);
+
+                    _lastPacketsIn = curIn;
+                    _lastPacketsOut = curOut;
+                }
+                catch { }
+            }
+        });
     }
 }
