@@ -1,8 +1,9 @@
+using System.Buffers;
 using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
+using System.Threading.Channels;
 
-// CreateSlimBuilder не создает лишних inotify наблюдателей
 var builder = WebApplication.CreateSlimBuilder(args);
 
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
@@ -12,12 +13,12 @@ var app = builder.Build();
 
 app.UseWebSockets(new WebSocketOptions
 {
-    KeepAliveInterval = TimeSpan.FromSeconds(20)
+    KeepAliveInterval = TimeSpan.FromSeconds(10)
 });
 
 const string SECRET_KEY = "my_super_secret_discord_key";
 
-app.MapGet("/", () => "UDP Relay Server is Running!");
+app.MapGet("/", () => "High-Performance UDP Relay Server is Running!");
 
 app.Map("/relay", async context =>
 {
@@ -36,61 +37,164 @@ app.Map("/relay", async context =>
 
     using var webSocket = await context.WebSockets.AcceptWebSocketAsync();
     using var udpClient = new UdpClient(0);
-    var buffer = new byte[65535];
+
+    // 4 MB буферы на Linux сервере
+    try
+    {
+        udpClient.Client.ReceiveBufferSize = 4 * 1024 * 1024;
+        udpClient.Client.SendBufferSize = 4 * 1024 * 1024;
+    }
+    catch { }
+
     using var cts = new CancellationTokenSource();
 
+    // Неблокирующие очереди (Channels) для мгновенной пересылки
+    var toWsChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+    var toUdpChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+
+    // Поток 1: Читаем UDP от Discord -> бросаем в Channel
     var udpReceiveTask = Task.Run(async () =>
     {
+        var remoteEp = new IPEndPoint(IPAddress.Any, 0);
         try
         {
-            while (!cts.IsCancellationRequested && webSocket.State == WebSocketState.Open)
+            while (!cts.IsCancellationRequested)
             {
-                var result = await udpClient.ReceiveAsync(cts.Token);
-                var ipBytes = result.RemoteEndPoint.Address.GetAddressBytes();
-                ushort remotePort = (ushort)result.RemoteEndPoint.Port;
+                var buffer = ArrayPool<byte>.Shared.Rent(65536);
+                var result = await udpClient.Client.ReceiveFromAsync(new ArraySegment<byte>(buffer, 6, 65530), SocketFlags.None, remoteEp);
+                var ep = (IPEndPoint)result.RemoteEndPoint;
 
-                var responseFrame = new byte[6 + result.Buffer.Length];
-                responseFrame[0] = ipBytes[0];
-                responseFrame[1] = ipBytes[1];
-                responseFrame[2] = ipBytes[2];
-                responseFrame[3] = ipBytes[3];
-                responseFrame[4] = (byte)(remotePort >> 8);
-                responseFrame[5] = (byte)(remotePort & 0xFF);
-                Buffer.BlockCopy(result.Buffer, 0, responseFrame, 6, result.Buffer.Length);
+                var ipBytes = ep.Address.GetAddressBytes();
+                ushort remotePort = (ushort)ep.Port;
 
-                await webSocket.SendAsync(responseFrame, WebSocketMessageType.Binary, true, cts.Token);
+                buffer[0] = ipBytes[0];
+                buffer[1] = ipBytes[1];
+                buffer[2] = ipBytes[2];
+                buffer[3] = ipBytes[3];
+                buffer[4] = (byte)(remotePort >> 8);
+                buffer[5] = (byte)(remotePort & 0xFF);
+
+                int totalLen = 6 + result.ReceivedBytes;
+                toWsChannel.Writer.TryWrite(new RentedPacket(buffer, totalLen, null));
             }
         }
         catch { }
     });
 
-    try
+    // Поток 2: Вычитываем Channel -> непрерывно шлем в WebSocket клиенту
+    var wsSendTask = Task.Run(async () =>
     {
-        while (webSocket.State == WebSocketState.Open)
+        try
         {
-            var receiveResult = await webSocket.ReceiveAsync(buffer, cts.Token);
-            if (receiveResult.MessageType == WebSocketMessageType.Close) break;
-
-            if (receiveResult.Count > 6)
+            var reader = toWsChannel.Reader;
+            while (await reader.WaitToReadAsync(cts.Token))
             {
-                var targetIp = new IPAddress(buffer.AsSpan(0, 4));
-                var targetPort = (ushort)((buffer[4] << 8) | buffer[5]);
-                var payload = buffer.AsMemory(6, receiveResult.Count - 6);
-
-                await udpClient.SendAsync(payload, new IPEndPoint(targetIp, targetPort), cts.Token);
+                while (reader.TryRead(out var packet))
+                {
+                    try
+                    {
+                        if (webSocket.State == WebSocketState.Open)
+                        {
+                            await webSocket.SendAsync(new ReadOnlyMemory<byte>(packet.Buffer, 0, packet.Length), WebSocketMessageType.Binary, true, cts.Token);
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(packet.Buffer);
+                    }
+                }
             }
         }
-    }
-    catch { }
-    finally
+        catch { }
+    });
+
+    // Поток 3: Читаем из WebSocket -> бросаем в Channel для UDP
+    var wsReceiveTask = Task.Run(async () =>
     {
-        cts.Cancel();
-        await udpReceiveTask;
-        if (webSocket.State == WebSocketState.Open)
+        try
         {
-            await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closed", CancellationToken.None);
+            while (!cts.IsCancellationRequested && webSocket.State == WebSocketState.Open)
+            {
+                var buffer = ArrayPool<byte>.Shared.Rent(65536);
+                var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), cts.Token);
+
+                if (result.MessageType == WebSocketMessageType.Close)
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                    break;
+                }
+
+                if (result.Count > 6)
+                {
+                    var targetIp = new IPAddress(buffer.AsSpan(0, 4));
+                    var targetPort = (ushort)((buffer[4] << 8) | buffer[5]);
+                    var ep = new IPEndPoint(targetIp, targetPort);
+
+                    toUdpChannel.Writer.TryWrite(new RentedPacket(buffer, result.Count, ep));
+                }
+                else
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+            }
         }
+        catch { }
+    });
+
+    // Поток 4: Вычитываем Channel -> шлем UDP в Discord
+    var udpSendTask = Task.Run(async () =>
+    {
+        try
+        {
+            var reader = toUdpChannel.Reader;
+            while (await reader.WaitToReadAsync(cts.Token))
+            {
+                while (reader.TryRead(out var packet))
+                {
+                    try
+                    {
+                        if (packet.EndPoint != null)
+                        {
+                            var data = new ReadOnlyMemory<byte>(packet.Buffer, 6, packet.Length - 6);
+                            await udpClient.SendAsync(data, packet.EndPoint, cts.Token);
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(packet.Buffer);
+                    }
+                }
+            }
+        }
+        catch { }
+    });
+
+    await Task.WhenAny(wsReceiveTask, udpReceiveTask);
+    cts.Cancel();
+
+    toWsChannel.Writer.TryComplete();
+    toUdpChannel.Writer.TryComplete();
+
+    await Task.WhenAll(wsSendTask, udpSendTask);
+
+    if (webSocket.State == WebSocketState.Open)
+    {
+        await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closed", CancellationToken.None);
     }
 });
 
-app.Run();  
+app.Run();
+
+public readonly struct RentedPacket
+{
+    public readonly byte[] Buffer;
+    public readonly int Length;
+    public readonly IPEndPoint? EndPoint;
+
+    public RentedPacket(byte[] buffer, int length, IPEndPoint? endPoint)
+    {
+        Buffer = buffer;
+        Length = length;
+        EndPoint = endPoint;
+    }
+}
