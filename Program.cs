@@ -3,6 +3,8 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
+using System.Text;
+using System.Text.Json.Nodes;
 using System.Threading.Channels;
 
 var builder = WebApplication.CreateSlimBuilder(args);
@@ -19,9 +21,9 @@ app.UseWebSockets(new WebSocketOptions
 
 const string SECRET_KEY = "my_super_secret_discord_key";
 
-app.MapGet("/", () => "High-Performance Adaptive UDP Relay Server is Running!");
+app.MapGet("/", () => "High-Performance Adaptive Batching UDP Relay Server is Running!");
 
-// Эндпоинт мониторинга для панели управления
+// Эндпоинт метрик для веб-панели управления
 app.MapGet("/stats", () =>
 {
     var uptime = DateTime.UtcNow - ServerMetrics.StartTime;
@@ -53,6 +55,15 @@ app.Map("/relay", async context =>
         return;
     }
 
+    // Начальная задержка пакетирования из query-параметра (по умолчанию 2 мс)
+    int initialBatchMs = 2;
+    if (int.TryParse(context.Request.Query["batchMs"], out int qBatchMs))
+    {
+        initialBatchMs = Math.Clamp(qBatchMs, 0, 1000);
+    }
+
+    int currentBatchDelayMs = initialBatchMs;
+
     using var webSocket = await context.WebSockets.AcceptWebSocketAsync();
     using var udpClient = new UdpClient(0);
 
@@ -67,16 +78,14 @@ app.Map("/relay", async context =>
 
     using var cts = new CancellationTokenSource();
 
-    // Очереди (Channels). toUdpChannel поддерживает параллельное чтение несколькими воркерами
     var toWsChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
     var toUdpChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = false, SingleWriter = true });
 
-    // Параметры адаптивного пула воркеров (от 2 до 100)
     const int MIN_WORKERS = 2;
     const int MAX_WORKERS = 100;
     int targetUdpWorkers = MIN_WORKERS;
 
-    // 1. Поток чтения UDP от Discord -> пишем в WebSocket Channel
+    // 1. Поток чтения входящих UDP пакетов от Discord/игр -> запись в очередь
     var udpReceiveTask = Task.Run(async () =>
     {
         var remoteEp = new IPEndPoint(IPAddress.Any, 0);
@@ -111,35 +120,95 @@ app.Map("/relay", async context =>
         }
     });
 
-    // 2. Поток отправки в WebSocket клиенту
+    // 2. Поток пакетирования и отправки пачками в WebSocket (Batching Engine)
     var wsSendTask = Task.Run(async () =>
     {
+        var reader = toWsChannel.Reader;
+        var batchBuffer = ArrayPool<byte>.Shared.Rent(65536);
+        var packetList = new List<RentedPacket>(32);
+
         try
         {
-            var reader = toWsChannel.Reader;
             while (await reader.WaitToReadAsync(CancellationToken.None))
             {
-                while (reader.TryRead(out var packet))
+                if (cts.IsCancellationRequested) break;
+
+                packetList.Clear();
+
+                if (reader.TryRead(out var firstPacket))
                 {
-                    try
+                    packetList.Add(firstPacket);
+                }
+                else
+                {
+                    continue;
+                }
+
+                int batchDelay = Volatile.Read(ref currentBatchDelayMs);
+
+                // Если задана задержка > 0, накапливаем пачку пакетов
+                if (batchDelay > 0)
+                {
+                    var sw = Stopwatch.StartNew();
+                    while (packetList.Count < 32 && sw.ElapsedMilliseconds < batchDelay)
                     {
-                        if (webSocket.State == WebSocketState.Open && !cts.IsCancellationRequested)
+                        if (reader.TryRead(out var nextPacket))
                         {
-                            await webSocket.SendAsync(new ReadOnlyMemory<byte>(packet.Buffer, 0, packet.Length), WebSocketMessageType.Binary, true, cts.Token);
+                            packetList.Add(nextPacket);
+                        }
+                        else
+                        {
+                            await Task.Delay(1, cts.Token).ConfigureAwait(false);
                         }
                     }
-                    catch { }
-                    finally
+                }
+                else
+                {
+                    // При 0 мс мгновенно забираем всё, что уже готово в очереди без задержки
+                    while (packetList.Count < 32 && reader.TryRead(out var nextPacket))
                     {
-                        ArrayPool<byte>.Shared.Return(packet.Buffer);
+                        packetList.Add(nextPacket);
                     }
+                }
+
+                // Упаковываем все пакеты в один фрейм с префиксом длины каждого пакета
+                int totalBatchLen = 0;
+                foreach (var p in packetList)
+                {
+                    if (totalBatchLen + 2 + p.Length > batchBuffer.Length)
+                        break;
+
+                    ushort pLen = (ushort)p.Length;
+                    batchBuffer[totalBatchLen] = (byte)(pLen >> 8);
+                    batchBuffer[totalBatchLen + 1] = (byte)(pLen & 0xFF);
+                    totalBatchLen += 2;
+
+                    Buffer.BlockCopy(p.Buffer, 0, batchBuffer, totalBatchLen, p.Length);
+                    totalBatchLen += p.Length;
+                }
+
+                // Освобождаем исходные буферы
+                foreach (var p in packetList)
+                {
+                    ArrayPool<byte>.Shared.Return(p.Buffer);
+                }
+
+                // Отправляем всю пачку одним вызовом WebSocket
+                if (totalBatchLen > 0 && webSocket.State == WebSocketState.Open && !cts.IsCancellationRequested)
+                {
+                    await webSocket.SendAsync(new ReadOnlyMemory<byte>(batchBuffer, 0, totalBatchLen), WebSocketMessageType.Binary, true, cts.Token);
                 }
             }
         }
         catch { }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(batchBuffer);
+            foreach (var p in packetList) ArrayPool<byte>.Shared.Return(p.Buffer);
+        }
     });
 
-    // 3. Поток чтения из WebSocket от клиента -> бросаем в очередь toUdpChannel
+    // 3. Поток чтения из WebSocket (прием пачек и команд управления задержкой)
     var wsReceiveTask = Task.Run(async () =>
     {
         while (!cts.IsCancellationRequested && webSocket.State == WebSocketState.Open)
@@ -155,29 +224,55 @@ app.Map("/relay", async context =>
                     break;
                 }
 
-                if (result.Count > 6)
+                // Управляющая текстовая команда от клиента для смены задержки на лету
+                if (result.MessageType == WebSocketMessageType.Text)
                 {
-                    var targetIp = new IPAddress(buffer.AsSpan(0, 4));
-                    var targetPort = (ushort)((buffer[4] << 8) | buffer[5]);
-                    var ep = new IPEndPoint(targetIp, targetPort);
-
-                    Interlocked.Increment(ref ServerMetrics.TotalPacketsOut);
-
-                    if (!toUdpChannel.Writer.TryWrite(new RentedPacket(buffer, result.Count, ep)))
+                    var text = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                    if (int.TryParse(text.Trim(), out int newBatchMs))
                     {
-                        ArrayPool<byte>.Shared.Return(buffer);
+                        Volatile.Write(ref currentBatchDelayMs, Math.Clamp(newBatchMs, 0, 1000));
+                    }
+                    ArrayPool<byte>.Shared.Return(buffer);
+                    continue;
+                }
+
+                // Разбор пачки бинарных пакетов по 2-байтовому префиксу длины
+                if (result.MessageType == WebSocketMessageType.Binary && result.Count >= 8)
+                {
+                    int offset = 0;
+                    while (offset + 2 <= result.Count)
+                    {
+                        ushort pLen = (ushort)((buffer[offset] << 8) | buffer[offset + 1]);
+                        offset += 2;
+
+                        if (pLen < 6 || offset + pLen > result.Count)
+                            break;
+
+                        var targetIp = new IPAddress(buffer.AsSpan(offset, 4));
+                        var targetPort = (ushort)((buffer[offset + 4] << 8) | buffer[offset + 5]);
+                        var ep = new IPEndPoint(targetIp, targetPort);
+
+                        byte[] subBuffer = ArrayPool<byte>.Shared.Rent(pLen);
+                        Buffer.BlockCopy(buffer, offset, subBuffer, 0, pLen);
+
+                        Interlocked.Increment(ref ServerMetrics.TotalPacketsOut);
+
+                        if (!toUdpChannel.Writer.TryWrite(new RentedPacket(subBuffer, pLen, ep)))
+                        {
+                            ArrayPool<byte>.Shared.Return(subBuffer);
+                        }
+
+                        offset += pLen;
                     }
                 }
-                else
-                {
-                    ArrayPool<byte>.Shared.Return(buffer);
-                }
+
+                ArrayPool<byte>.Shared.Return(buffer);
             }
             catch { ArrayPool<byte>.Shared.Return(buffer); break; }
         }
     });
 
-    // 4. Метод единичного параллельного UDP воркера
+    // 4. Параллельный воркер рассылки UDP в Discord
     async Task RunUdpWorkerAsync(int workerId)
     {
         Interlocked.Increment(ref ServerMetrics.TotalActiveWorkers);
@@ -186,11 +281,8 @@ app.Map("/relay", async context =>
             var reader = toUdpChannel.Reader;
             while (!cts.IsCancellationRequested)
             {
-                // Проверка: если лимит воркеров уменьшился из-за высокой нагрузки CPU — завершаем лишний воркер
                 if (workerId > Volatile.Read(ref targetUdpWorkers))
-                {
                     break;
-                }
 
                 if (!await reader.WaitToReadAsync(CancellationToken.None))
                     break;
@@ -211,11 +303,8 @@ app.Map("/relay", async context =>
                         ArrayPool<byte>.Shared.Return(packet.Buffer);
                     }
 
-                    // Проверка на плавное масштабирование вниз
                     if (workerId > Volatile.Read(ref targetUdpWorkers))
-                    {
                         return;
-                    }
                 }
             }
         }
@@ -225,14 +314,13 @@ app.Map("/relay", async context =>
         }
     }
 
-    // Запуск базовых воркеров
     for (int i = 1; i <= MIN_WORKERS; i++)
     {
         int id = i;
         _ = Task.Run(() => RunUdpWorkerAsync(id));
     }
 
-    // 5. Адаптивный супервизор: динамически масштабирует воркеры до 100 штук при CPU < 80%
+    // 5. Адаптивный супервизор (до 100 воркеров при CPU < 80%)
     var supervisorTask = Task.Run(async () =>
     {
         while (!cts.IsCancellationRequested)
@@ -247,7 +335,6 @@ app.Map("/relay", async context =>
 
                 if (currentCpu > 80.0)
                 {
-                    // ⚠️ Перегрузка CPU (>80%): плавно снижаем количество воркеров
                     if (currentLimit > MIN_WORKERS)
                     {
                         int newLimit = Math.Max(MIN_WORKERS, currentLimit - 5);
@@ -256,7 +343,6 @@ app.Map("/relay", async context =>
                 }
                 else if (currentCpu < 75.0 && queueCount > 0)
                 {
-                    // 🚀 Процессор свободен (<75%) и в очереди есть пакеты: масштабируем вверх
                     if (currentLimit < MAX_WORKERS)
                     {
                         int boost = Math.Min(10, queueCount + 1);
@@ -272,7 +358,6 @@ app.Map("/relay", async context =>
                 }
                 else if (queueCount == 0 && currentLimit > 4)
                 {
-                    // Очередь пуста (затишье): плавно возвращаемся к базовому количеству
                     Volatile.Write(ref targetUdpWorkers, Math.Max(4, currentLimit - 2));
                 }
             }
@@ -281,14 +366,12 @@ app.Map("/relay", async context =>
         }
     });
 
-    // Ожидание завершения работы
     await Task.WhenAny(wsReceiveTask, udpReceiveTask);
     cts.Cancel();
 
     toWsChannel.Writer.TryComplete();
     toUdpChannel.Writer.TryComplete();
 
-    // Очистка оставшихся буферов в очередях
     while (toWsChannel.Reader.TryRead(out var p)) ArrayPool<byte>.Shared.Return(p.Buffer);
     while (toUdpChannel.Reader.TryRead(out var p)) ArrayPool<byte>.Shared.Return(p.Buffer);
 
