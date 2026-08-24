@@ -19,9 +19,9 @@ app.UseWebSockets(new WebSocketOptions
 
 const string SECRET_KEY = "my_super_secret_discord_key";
 
-app.MapGet("/", () => "High-Performance UDP Relay Server is Running!");
+app.MapGet("/", () => "High-Performance Adaptive UDP Relay Server is Running!");
 
-// Эндпоинт метрик для мониторинга состояния Render
+// Эндпоинт мониторинга для панели управления
 app.MapGet("/stats", () =>
 {
     var uptime = DateTime.UtcNow - ServerMetrics.StartTime;
@@ -33,6 +33,7 @@ app.MapGet("/stats", () =>
         packetsIn = ServerMetrics.PacketsInPerSec,
         packetsOut = ServerMetrics.PacketsOutPerSec,
         activeRelays = ServerMetrics.ActiveRelays,
+        totalWorkers = ServerMetrics.TotalActiveWorkers,
         cores = Environment.ProcessorCount
     });
 });
@@ -66,10 +67,16 @@ app.Map("/relay", async context =>
 
     using var cts = new CancellationTokenSource();
 
-    var toWsChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
-    var toUdpChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+    // Очереди (Channels). toUdpChannel поддерживает параллельное чтение несколькими воркерами
+    var toWsChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+    var toUdpChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = false, SingleWriter = true });
 
-    // Поток 1: UDP от Discord -> Channel
+    // Параметры адаптивного пула воркеров (от 2 до 100)
+    const int MIN_WORKERS = 2;
+    const int MAX_WORKERS = 100;
+    int targetUdpWorkers = MIN_WORKERS;
+
+    // 1. Поток чтения UDP от Discord -> пишем в WebSocket Channel
     var udpReceiveTask = Task.Run(async () =>
     {
         var remoteEp = new IPEndPoint(IPAddress.Any, 0);
@@ -104,7 +111,7 @@ app.Map("/relay", async context =>
         }
     });
 
-    // Поток 2: Channel -> WebSocket
+    // 2. Поток отправки в WebSocket клиенту
     var wsSendTask = Task.Run(async () =>
     {
         try
@@ -132,7 +139,7 @@ app.Map("/relay", async context =>
         catch { }
     });
 
-    // Поток 3: WebSocket -> Channel
+    // 3. Поток чтения из WebSocket от клиента -> бросаем в очередь toUdpChannel
     var wsReceiveTask = Task.Run(async () =>
     {
         while (!cts.IsCancellationRequested && webSocket.State == WebSocketState.Open)
@@ -170,14 +177,24 @@ app.Map("/relay", async context =>
         }
     });
 
-    // Поток 4: Channel -> UDP в Discord
-    var udpSendTask = Task.Run(async () =>
+    // 4. Метод единичного параллельного UDP воркера
+    async Task RunUdpWorkerAsync(int workerId)
     {
+        Interlocked.Increment(ref ServerMetrics.TotalActiveWorkers);
         try
         {
             var reader = toUdpChannel.Reader;
-            while (await reader.WaitToReadAsync(CancellationToken.None))
+            while (!cts.IsCancellationRequested)
             {
+                // Проверка: если лимит воркеров уменьшился из-за высокой нагрузки CPU — завершаем лишний воркер
+                if (workerId > Volatile.Read(ref targetUdpWorkers))
+                {
+                    break;
+                }
+
+                if (!await reader.WaitToReadAsync(CancellationToken.None))
+                    break;
+
                 while (reader.TryRead(out var packet))
                 {
                     try
@@ -193,19 +210,87 @@ app.Map("/relay", async context =>
                     {
                         ArrayPool<byte>.Shared.Return(packet.Buffer);
                     }
+
+                    // Проверка на плавное масштабирование вниз
+                    if (workerId > Volatile.Read(ref targetUdpWorkers))
+                    {
+                        return;
+                    }
                 }
             }
         }
-        catch { }
+        finally
+        {
+            Interlocked.Decrement(ref ServerMetrics.TotalActiveWorkers);
+        }
+    }
+
+    // Запуск базовых воркеров
+    for (int i = 1; i <= MIN_WORKERS; i++)
+    {
+        int id = i;
+        _ = Task.Run(() => RunUdpWorkerAsync(id));
+    }
+
+    // 5. Адаптивный супервизор: динамически масштабирует воркеры до 100 штук при CPU < 80%
+    var supervisorTask = Task.Run(async () =>
+    {
+        while (!cts.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(500, cts.Token);
+
+                double currentCpu = ServerMetrics.CpuUsagePercent;
+                int queueCount = toUdpChannel.Reader.Count;
+                int currentLimit = Volatile.Read(ref targetUdpWorkers);
+
+                if (currentCpu > 80.0)
+                {
+                    // ⚠️ Перегрузка CPU (>80%): плавно снижаем количество воркеров
+                    if (currentLimit > MIN_WORKERS)
+                    {
+                        int newLimit = Math.Max(MIN_WORKERS, currentLimit - 5);
+                        Volatile.Write(ref targetUdpWorkers, newLimit);
+                    }
+                }
+                else if (currentCpu < 75.0 && queueCount > 0)
+                {
+                    // 🚀 Процессор свободен (<75%) и в очереди есть пакеты: масштабируем вверх
+                    if (currentLimit < MAX_WORKERS)
+                    {
+                        int boost = Math.Min(10, queueCount + 1);
+                        int newLimit = Math.Min(MAX_WORKERS, currentLimit + boost);
+                        Volatile.Write(ref targetUdpWorkers, newLimit);
+
+                        for (int i = currentLimit + 1; i <= newLimit; i++)
+                        {
+                            int id = i;
+                            _ = Task.Run(() => RunUdpWorkerAsync(id));
+                        }
+                    }
+                }
+                else if (queueCount == 0 && currentLimit > 4)
+                {
+                    // Очередь пуста (затишье): плавно возвращаемся к базовому количеству
+                    Volatile.Write(ref targetUdpWorkers, Math.Max(4, currentLimit - 2));
+                }
+            }
+            catch (OperationCanceledException) { break; }
+            catch { }
+        }
     });
 
+    // Ожидание завершения работы
     await Task.WhenAny(wsReceiveTask, udpReceiveTask);
     cts.Cancel();
 
     toWsChannel.Writer.TryComplete();
     toUdpChannel.Writer.TryComplete();
 
-    await Task.WhenAll(wsSendTask, udpSendTask);
+    // Очистка оставшихся буферов в очередях
+    while (toWsChannel.Reader.TryRead(out var p)) ArrayPool<byte>.Shared.Return(p.Buffer);
+    while (toUdpChannel.Reader.TryRead(out var p)) ArrayPool<byte>.Shared.Return(p.Buffer);
 
     Interlocked.Decrement(ref ServerMetrics.ActiveRelays);
 
@@ -247,6 +332,7 @@ public static class ServerMetrics
     public static long PacketsInPerSec { get; private set; }
     public static long PacketsOutPerSec { get; private set; }
     public static int ActiveRelays;
+    public static int TotalActiveWorkers;
 
     private static long _lastPacketsIn;
     private static long _lastPacketsOut;
