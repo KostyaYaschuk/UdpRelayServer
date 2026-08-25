@@ -3,7 +3,6 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
-using System.Text;
 using System.Threading.Channels;
 
 var builder = WebApplication.CreateSlimBuilder(args);
@@ -20,7 +19,7 @@ app.UseWebSockets(new WebSocketOptions
 
 const string SECRET_KEY = "my_super_secret_discord_key";
 
-app.MapGet("/", () => "High-Performance Zero-Jitter Relay Server is Running!");
+app.MapGet("/", () => "High-Performance Zero-Latency UDP Relay Server is Running!");
 
 app.MapGet("/stats", () =>
 {
@@ -33,7 +32,6 @@ app.MapGet("/stats", () =>
         packetsIn = ServerMetrics.PacketsInPerSec,
         packetsOut = ServerMetrics.PacketsOutPerSec,
         activeRelays = ServerMetrics.ActiveRelays,
-        totalWorkers = ServerMetrics.TotalActiveWorkers,
         cores = Environment.ProcessorCount
     });
 });
@@ -53,14 +51,6 @@ app.Map("/relay", async context =>
         return;
     }
 
-    int initialBatchMs = 0;
-    if (int.TryParse(context.Request.Query["batchMs"], out int qBatchMs))
-    {
-        initialBatchMs = Math.Clamp(qBatchMs, 0, 1000);
-    }
-
-    int currentBatchDelayMs = initialBatchMs;
-
     using var webSocket = await context.WebSockets.AcceptWebSocketAsync();
     using var udpClient = new UdpClient(0);
 
@@ -75,10 +65,10 @@ app.Map("/relay", async context =>
 
     using var cts = new CancellationTokenSource();
 
-    var toWsChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+    var toWsChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
     var toUdpChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
 
-    // 1. Прием от Discord (голос и видео людей)
+    // 1. Прием входящих UDP от Discord -> мгновенно в WebSocket Channel
     var udpReceiveTask = Task.Run(async () =>
     {
         var remoteEp = new IPEndPoint(IPAddress.Any, 0);
@@ -113,63 +103,35 @@ app.Map("/relay", async context =>
         }
     });
 
-    // 2. Отправка клиенту: строгий FIFO порядок + мгновенный дренаж пачек кадра
+    // 2. Мгновенная отправка в WebSocket клиенту без задержек
     var wsSendTask = Task.Run(async () =>
     {
         var reader = toWsChannel.Reader;
-        var batchBuffer = ArrayPool<byte>.Shared.Rent(65536);
-        var packetList = new List<RentedPacket>(48);
-
         try
         {
             while (await reader.WaitToReadAsync(CancellationToken.None))
             {
-                if (cts.IsCancellationRequested) break;
-
-                packetList.Clear();
-
-                if (!reader.TryRead(out var firstPacket))
-                    continue;
-
-                packetList.Add(firstPacket);
-
-                while (packetList.Count < 40 && reader.TryRead(out var nextPacket))
+                while (reader.TryRead(out var packet))
                 {
-                    packetList.Add(nextPacket);
-                }
-
-                int totalBatchLen = 0;
-                foreach (var p in packetList)
-                {
-                    ushort pLen = (ushort)p.Length;
-                    if (totalBatchLen + 2 + pLen > batchBuffer.Length)
-                        break;
-
-                    batchBuffer[totalBatchLen] = (byte)(pLen >> 8);
-                    batchBuffer[totalBatchLen + 1] = (byte)(pLen & 0xFF);
-                    totalBatchLen += 2;
-
-                    Buffer.BlockCopy(p.Buffer, 0, batchBuffer, totalBatchLen, p.Length);
-                    totalBatchLen += p.Length;
-                }
-
-                foreach (var p in packetList) ArrayPool<byte>.Shared.Return(p.Buffer);
-
-                if (totalBatchLen > 0 && webSocket.State == WebSocketState.Open && !cts.IsCancellationRequested)
-                {
-                    await webSocket.SendAsync(new ReadOnlyMemory<byte>(batchBuffer, 0, totalBatchLen), WebSocketMessageType.Binary, true, cts.Token);
+                    try
+                    {
+                        if (webSocket.State == WebSocketState.Open && !cts.IsCancellationRequested)
+                        {
+                            await webSocket.SendAsync(new ReadOnlyMemory<byte>(packet.Buffer, 0, packet.Length), WebSocketMessageType.Binary, true, cts.Token);
+                        }
+                    }
+                    catch { }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(packet.Buffer);
+                    }
                 }
             }
         }
         catch { }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(batchBuffer);
-            foreach (var p in packetList) ArrayPool<byte>.Shared.Return(p.Buffer);
-        }
     });
 
-    // 3. Прием пачек из WebSocket
+    // 3. Прием из WebSocket от клиента
     var wsReceiveTask = Task.Run(async () =>
     {
         while (!cts.IsCancellationRequested && webSocket.State == WebSocketState.Open)
@@ -185,53 +147,29 @@ app.Map("/relay", async context =>
                     break;
                 }
 
-                if (result.MessageType == WebSocketMessageType.Text)
+                if (result.MessageType == WebSocketMessageType.Binary && result.Count > 6)
                 {
-                    var text = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                    if (int.TryParse(text.Trim(), out int newBatchMs))
+                    var targetIp = new IPAddress(buffer.AsSpan(0, 4));
+                    var targetPort = (ushort)((buffer[4] << 8) | buffer[5]);
+                    var ep = new IPEndPoint(targetIp, targetPort);
+
+                    Interlocked.Increment(ref ServerMetrics.TotalPacketsOut);
+
+                    if (!toUdpChannel.Writer.TryWrite(new RentedPacket(buffer, result.Count, ep)))
                     {
-                        Volatile.Write(ref currentBatchDelayMs, Math.Clamp(newBatchMs, 0, 1000));
+                        ArrayPool<byte>.Shared.Return(buffer);
                     }
+                }
+                else
+                {
                     ArrayPool<byte>.Shared.Return(buffer);
-                    continue;
                 }
-
-                if (result.MessageType == WebSocketMessageType.Binary && result.Count >= 8)
-                {
-                    int offset = 0;
-                    while (offset + 2 <= result.Count)
-                    {
-                        ushort pLen = (ushort)((buffer[offset] << 8) | buffer[offset + 1]);
-                        offset += 2;
-
-                        if (pLen < 6 || offset + pLen > result.Count)
-                            break;
-
-                        var targetIp = new IPAddress(buffer.AsSpan(offset, 4));
-                        var targetPort = (ushort)((buffer[offset + 4] << 8) | buffer[offset + 5]);
-                        var ep = new IPEndPoint(targetIp, targetPort);
-
-                        byte[] subBuffer = ArrayPool<byte>.Shared.Rent(pLen);
-                        Buffer.BlockCopy(buffer, offset, subBuffer, 0, pLen);
-
-                        Interlocked.Increment(ref ServerMetrics.TotalPacketsOut);
-
-                        if (!toUdpChannel.Writer.TryWrite(new RentedPacket(subBuffer, pLen, ep)))
-                        {
-                            ArrayPool<byte>.Shared.Return(subBuffer);
-                        }
-
-                        offset += pLen;
-                    }
-                }
-
-                ArrayPool<byte>.Shared.Return(buffer);
             }
             catch { ArrayPool<byte>.Shared.Return(buffer); break; }
         }
     });
 
-    // 4. Мгновенная прямая отправка в Discord
+    // 4. Мгновенная отправка UDP в Discord
     var udpSendTask = Task.Run(async () =>
     {
         var reader = toUdpChannel.Reader;
@@ -245,7 +183,8 @@ app.Map("/relay", async context =>
                     {
                         if (packet.EndPoint != null && !cts.IsCancellationRequested)
                         {
-                            udpClient.Client.SendTo(packet.Buffer, 6, packet.Length - 6, SocketFlags.None, packet.EndPoint);
+                            var data = new ReadOnlyMemory<byte>(packet.Buffer, 6, packet.Length - 6);
+                            await udpClient.SendAsync(data, packet.EndPoint, cts.Token);
                         }
                     }
                     catch { }
@@ -304,7 +243,6 @@ public static class ServerMetrics
     public static long PacketsInPerSec { get; private set; }
     public static long PacketsOutPerSec { get; private set; }
     public static int ActiveRelays;
-    public static int TotalActiveWorkers;
 
     private static long _lastPacketsIn;
     private static long _lastPacketsOut;
