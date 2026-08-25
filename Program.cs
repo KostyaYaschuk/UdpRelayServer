@@ -19,9 +19,8 @@ app.UseWebSockets(new WebSocketOptions
 });
 
 const string SECRET_KEY = "my_super_secret_discord_key";
-const int VOICE_PACKET_MAX_SIZE = 300;
 
-app.MapGet("/", () => "High-Performance QoS Instant UDP Relay Server is Running!");
+app.MapGet("/", () => "High-Performance Zero-Jitter Relay Server is Running!");
 
 app.MapGet("/stats", () =>
 {
@@ -54,7 +53,7 @@ app.Map("/relay", async context =>
         return;
     }
 
-    int initialBatchMs = 2;
+    int initialBatchMs = 0;
     if (int.TryParse(context.Request.Query["batchMs"], out int qBatchMs))
     {
         initialBatchMs = Math.Clamp(qBatchMs, 0, 1000);
@@ -76,15 +75,10 @@ app.Map("/relay", async context =>
 
     using var cts = new CancellationTokenSource();
 
-    var voiceToWsChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
-    var videoToWsChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
-    var toUdpChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = false, SingleWriter = true });
+    var toWsChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+    var toUdpChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
 
-    const int MIN_WORKERS = 2;
-    const int MAX_WORKERS = 100;
-    int targetUdpWorkers = MIN_WORKERS;
-
-    // 1. Прием от Discord и разделение на Голос и Видео
+    // 1. Прием от Discord (голос и видео людей)
     var udpReceiveTask = Task.Run(async () =>
     {
         var remoteEp = new IPEndPoint(IPAddress.Any, 0);
@@ -109,15 +103,9 @@ app.Map("/relay", async context =>
                 int totalLen = 6 + result.ReceivedBytes;
                 Interlocked.Increment(ref ServerMetrics.TotalPacketsIn);
 
-                if (result.ReceivedBytes <= VOICE_PACKET_MAX_SIZE)
+                if (!toWsChannel.Writer.TryWrite(new RentedPacket(buffer, totalLen, null)))
                 {
-                    if (!voiceToWsChannel.Writer.TryWrite(new RentedPacket(buffer, totalLen, null)))
-                        ArrayPool<byte>.Shared.Return(buffer);
-                }
-                else
-                {
-                    if (!videoToWsChannel.Writer.TryWrite(new RentedPacket(buffer, totalLen, null)))
-                        ArrayPool<byte>.Shared.Return(buffer);
+                    ArrayPool<byte>.Shared.Return(buffer);
                 }
             }
             catch (OperationCanceledException) { ArrayPool<byte>.Shared.Return(buffer); break; }
@@ -125,66 +113,29 @@ app.Map("/relay", async context =>
         }
     });
 
-    // 2. QoS отправка клиенту: голос вне очереди + видео пачками
+    // 2. Отправка клиенту: строгий FIFO порядок + мгновенный дренаж пачек кадра
     var wsSendTask = Task.Run(async () =>
     {
-        var voiceReader = voiceToWsChannel.Reader;
-        var videoReader = videoToWsChannel.Reader;
-
+        var reader = toWsChannel.Reader;
         var batchBuffer = ArrayPool<byte>.Shared.Rent(65536);
         var packetList = new List<RentedPacket>(48);
 
         try
         {
-            while (!cts.IsCancellationRequested)
+            while (await reader.WaitToReadAsync(CancellationToken.None))
             {
+                if (cts.IsCancellationRequested) break;
+
                 packetList.Clear();
 
-                while (packetList.Count < 10 && voiceReader.TryRead(out var vp))
-                    packetList.Add(vp);
+                if (!reader.TryRead(out var firstPacket))
+                    continue;
 
-                while (packetList.Count < 40 && videoReader.TryRead(out var vidP))
-                    packetList.Add(vidP);
+                packetList.Add(firstPacket);
 
-                if (packetList.Count == 0)
+                while (packetList.Count < 40 && reader.TryRead(out var nextPacket))
                 {
-                    var voiceWait = voiceReader.WaitToReadAsync(CancellationToken.None).AsTask();
-                    var videoWait = videoReader.WaitToReadAsync(CancellationToken.None).AsTask();
-
-                    var completed = await Task.WhenAny(voiceWait, videoWait);
-                    if (await completed)
-                    {
-                        while (packetList.Count < 10 && voiceReader.TryRead(out var vp))
-                            packetList.Add(vp);
-                        while (packetList.Count < 40 && videoReader.TryRead(out var vidP))
-                            packetList.Add(vidP);
-                    }
-                }
-
-                if (packetList.Count == 0) continue;
-
-                int delay = Volatile.Read(ref currentBatchDelayMs);
-                bool hasVoice = packetList.Any(p => (p.Length - 6) <= VOICE_PACKET_MAX_SIZE);
-
-                if (delay > 0 && !hasVoice && packetList.Count < 30)
-                {
-                    var sw = Stopwatch.StartNew();
-                    while (packetList.Count < 40 && sw.ElapsedMilliseconds < delay)
-                    {
-                        if (voiceReader.TryRead(out var vp))
-                        {
-                            packetList.Insert(0, vp);
-                            break;
-                        }
-                        if (videoReader.TryRead(out var vidP))
-                        {
-                            packetList.Add(vidP);
-                        }
-                        else
-                        {
-                            await Task.Delay(1, cts.Token).ConfigureAwait(false);
-                        }
-                    }
+                    packetList.Add(nextPacket);
                 }
 
                 int totalBatchLen = 0;
@@ -280,29 +231,21 @@ app.Map("/relay", async context =>
         }
     });
 
-    // 4. Мгновенная отправка в Discord
-    async Task RunUdpWorkerAsync(int workerId)
+    // 4. Мгновенная прямая отправка в Discord
+    var udpSendTask = Task.Run(async () =>
     {
-        Interlocked.Increment(ref ServerMetrics.TotalActiveWorkers);
+        var reader = toUdpChannel.Reader;
         try
         {
-            var reader = toUdpChannel.Reader;
-            while (!cts.IsCancellationRequested)
+            while (await reader.WaitToReadAsync(CancellationToken.None))
             {
-                if (workerId > Volatile.Read(ref targetUdpWorkers))
-                    break;
-
-                if (!await reader.WaitToReadAsync(CancellationToken.None))
-                    break;
-
                 while (reader.TryRead(out var packet))
                 {
                     try
                     {
                         if (packet.EndPoint != null && !cts.IsCancellationRequested)
                         {
-                            var data = new ReadOnlyMemory<byte>(packet.Buffer, 6, packet.Length - 6);
-                            await udpClient.SendAsync(data, packet.EndPoint, cts.Token);
+                            udpClient.Client.SendTo(packet.Buffer, 6, packet.Length - 6, SocketFlags.None, packet.EndPoint);
                         }
                     }
                     catch { }
@@ -310,78 +253,19 @@ app.Map("/relay", async context =>
                     {
                         ArrayPool<byte>.Shared.Return(packet.Buffer);
                     }
-
-                    if (workerId > Volatile.Read(ref targetUdpWorkers))
-                        return;
                 }
             }
         }
-        finally
-        {
-            Interlocked.Decrement(ref ServerMetrics.TotalActiveWorkers);
-        }
-    }
-
-    for (int i = 1; i <= MIN_WORKERS; i++)
-    {
-        int id = i;
-        _ = Task.Run(() => RunUdpWorkerAsync(id));
-    }
-
-    // 5. Супервизор CPU
-    var supervisorTask = Task.Run(async () =>
-    {
-        while (!cts.IsCancellationRequested)
-        {
-            try
-            {
-                await Task.Delay(500, cts.Token);
-
-                double currentCpu = ServerMetrics.CpuUsagePercent;
-                int queueCount = toUdpChannel.Reader.Count;
-                int currentLimit = Volatile.Read(ref targetUdpWorkers);
-
-                if (currentCpu > 80.0)
-                {
-                    if (currentLimit > MIN_WORKERS)
-                    {
-                        Volatile.Write(ref targetUdpWorkers, Math.Max(MIN_WORKERS, currentLimit - 5));
-                    }
-                }
-                else if (currentCpu < 75.0 && queueCount > 0)
-                {
-                    if (currentLimit < MAX_WORKERS)
-                    {
-                        int boost = Math.Min(10, queueCount + 1);
-                        int newLimit = Math.Min(MAX_WORKERS, currentLimit + boost);
-                        Volatile.Write(ref targetUdpWorkers, newLimit);
-
-                        for (int i = currentLimit + 1; i <= newLimit; i++)
-                        {
-                            int id = i;
-                            _ = Task.Run(() => RunUdpWorkerAsync(id));
-                        }
-                    }
-                }
-                else if (queueCount == 0 && currentLimit > 4)
-                {
-                    Volatile.Write(ref targetUdpWorkers, Math.Max(4, currentLimit - 2));
-                }
-            }
-            catch (OperationCanceledException) { break; }
-            catch { }
-        }
+        catch { }
     });
 
     await Task.WhenAny(wsReceiveTask, udpReceiveTask);
     cts.Cancel();
 
-    voiceToWsChannel.Writer.TryComplete();
-    videoToWsChannel.Writer.TryComplete();
+    toWsChannel.Writer.TryComplete();
     toUdpChannel.Writer.TryComplete();
 
-    while (voiceToWsChannel.Reader.TryRead(out var p)) ArrayPool<byte>.Shared.Return(p.Buffer);
-    while (videoToWsChannel.Reader.TryRead(out var p)) ArrayPool<byte>.Shared.Return(p.Buffer);
+    while (toWsChannel.Reader.TryRead(out var p)) ArrayPool<byte>.Shared.Return(p.Buffer);
     while (toUdpChannel.Reader.TryRead(out var p)) ArrayPool<byte>.Shared.Return(p.Buffer);
 
     Interlocked.Decrement(ref ServerMetrics.ActiveRelays);
