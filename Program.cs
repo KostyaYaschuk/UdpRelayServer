@@ -19,8 +19,9 @@ app.UseWebSockets(new WebSocketOptions
 });
 
 const string SECRET_KEY = "my_super_secret_discord_key";
+const int VOICE_PACKET_MAX_SIZE = 300;
 
-app.MapGet("/", () => "High-Performance Instant-Burst UDP Relay Server is Running!");
+app.MapGet("/", () => "High-Performance QoS Instant UDP Relay Server is Running!");
 
 app.MapGet("/stats", () =>
 {
@@ -75,14 +76,15 @@ app.Map("/relay", async context =>
 
     using var cts = new CancellationTokenSource();
 
-    var toWsChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+    var voiceToWsChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+    var videoToWsChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
     var toUdpChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = false, SingleWriter = true });
 
     const int MIN_WORKERS = 2;
     const int MAX_WORKERS = 100;
     int targetUdpWorkers = MIN_WORKERS;
 
-    // 1. Прием UDP от Discord
+    // 1. Прием от Discord и разделение на Голос и Видео
     var udpReceiveTask = Task.Run(async () =>
     {
         var remoteEp = new IPEndPoint(IPAddress.Any, 0);
@@ -107,9 +109,15 @@ app.Map("/relay", async context =>
                 int totalLen = 6 + result.ReceivedBytes;
                 Interlocked.Increment(ref ServerMetrics.TotalPacketsIn);
 
-                if (!toWsChannel.Writer.TryWrite(new RentedPacket(buffer, totalLen, null)))
+                if (result.ReceivedBytes <= VOICE_PACKET_MAX_SIZE)
                 {
-                    ArrayPool<byte>.Shared.Return(buffer);
+                    if (!voiceToWsChannel.Writer.TryWrite(new RentedPacket(buffer, totalLen, null)))
+                        ArrayPool<byte>.Shared.Return(buffer);
+                }
+                else
+                {
+                    if (!videoToWsChannel.Writer.TryWrite(new RentedPacket(buffer, totalLen, null)))
+                        ArrayPool<byte>.Shared.Return(buffer);
                 }
             }
             catch (OperationCanceledException) { ArrayPool<byte>.Shared.Return(buffer); break; }
@@ -117,50 +125,65 @@ app.Map("/relay", async context =>
         }
     });
 
-    // 2. Сбор в пачки на отправке в WebSocket
+    // 2. QoS отправка клиенту: голос вне очереди + видео пачками
     var wsSendTask = Task.Run(async () =>
     {
-        var reader = toWsChannel.Reader;
+        var voiceReader = voiceToWsChannel.Reader;
+        var videoReader = videoToWsChannel.Reader;
+
         var batchBuffer = ArrayPool<byte>.Shared.Rent(65536);
-        var packetList = new List<RentedPacket>(32);
+        var packetList = new List<RentedPacket>(48);
 
         try
         {
-            while (await reader.WaitToReadAsync(CancellationToken.None))
+            while (!cts.IsCancellationRequested)
             {
-                if (cts.IsCancellationRequested) break;
-
                 packetList.Clear();
 
-                if (!reader.TryRead(out var firstPacket))
-                    continue;
+                while (packetList.Count < 10 && voiceReader.TryRead(out var vp))
+                    packetList.Add(vp);
 
-                packetList.Add(firstPacket);
+                while (packetList.Count < 40 && videoReader.TryRead(out var vidP))
+                    packetList.Add(vidP);
 
-                int batchDelay = Volatile.Read(ref currentBatchDelayMs);
-                bool isHandshake = firstPacket.Length <= 120;
+                if (packetList.Count == 0)
+                {
+                    var voiceWait = voiceReader.WaitToReadAsync(CancellationToken.None).AsTask();
+                    var videoWait = videoReader.WaitToReadAsync(CancellationToken.None).AsTask();
 
-                if (batchDelay > 0 && !isHandshake)
+                    var completed = await Task.WhenAny(voiceWait, videoWait);
+                    if (await completed)
+                    {
+                        while (packetList.Count < 10 && voiceReader.TryRead(out var vp))
+                            packetList.Add(vp);
+                        while (packetList.Count < 40 && videoReader.TryRead(out var vidP))
+                            packetList.Add(vidP);
+                    }
+                }
+
+                if (packetList.Count == 0) continue;
+
+                int delay = Volatile.Read(ref currentBatchDelayMs);
+                bool hasVoice = packetList.Any(p => (p.Length - 6) <= VOICE_PACKET_MAX_SIZE);
+
+                if (delay > 0 && !hasVoice && packetList.Count < 30)
                 {
                     var sw = Stopwatch.StartNew();
-                    while (packetList.Count < 32 && sw.ElapsedMilliseconds < batchDelay)
+                    while (packetList.Count < 40 && sw.ElapsedMilliseconds < delay)
                     {
-                        if (reader.TryRead(out var nextPacket))
+                        if (voiceReader.TryRead(out var vp))
                         {
-                            packetList.Add(nextPacket);
-                            if (nextPacket.Length <= 120) break;
+                            packetList.Insert(0, vp);
+                            break;
+                        }
+                        if (videoReader.TryRead(out var vidP))
+                        {
+                            packetList.Add(vidP);
                         }
                         else
                         {
                             await Task.Delay(1, cts.Token).ConfigureAwait(false);
                         }
-                    }
-                }
-                else
-                {
-                    while (packetList.Count < 32 && reader.TryRead(out var nextPacket))
-                    {
-                        packetList.Add(nextPacket);
                     }
                 }
 
@@ -195,7 +218,7 @@ app.Map("/relay", async context =>
         }
     });
 
-    // 3. Прием из WebSocket
+    // 3. Прием пачек из WebSocket
     var wsReceiveTask = Task.Run(async () =>
     {
         while (!cts.IsCancellationRequested && webSocket.State == WebSocketState.Open)
@@ -257,7 +280,7 @@ app.Map("/relay", async context =>
         }
     });
 
-    // 4. Мгновенная отправка UDP в Discord без задержек
+    // 4. Мгновенная отправка в Discord
     async Task RunUdpWorkerAsync(int workerId)
     {
         Interlocked.Increment(ref ServerMetrics.TotalActiveWorkers);
@@ -353,10 +376,12 @@ app.Map("/relay", async context =>
     await Task.WhenAny(wsReceiveTask, udpReceiveTask);
     cts.Cancel();
 
-    toWsChannel.Writer.TryComplete();
+    voiceToWsChannel.Writer.TryComplete();
+    videoToWsChannel.Writer.TryComplete();
     toUdpChannel.Writer.TryComplete();
 
-    while (toWsChannel.Reader.TryRead(out var p)) ArrayPool<byte>.Shared.Return(p.Buffer);
+    while (voiceToWsChannel.Reader.TryRead(out var p)) ArrayPool<byte>.Shared.Return(p.Buffer);
+    while (videoToWsChannel.Reader.TryRead(out var p)) ArrayPool<byte>.Shared.Return(p.Buffer);
     while (toUdpChannel.Reader.TryRead(out var p)) ArrayPool<byte>.Shared.Return(p.Buffer);
 
     Interlocked.Decrement(ref ServerMetrics.ActiveRelays);
