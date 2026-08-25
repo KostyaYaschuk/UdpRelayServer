@@ -20,7 +20,7 @@ app.UseWebSockets(new WebSocketOptions
 
 const string SECRET_KEY = "my_super_secret_discord_key";
 
-app.MapGet("/", () => "High-Performance Zero-Jitter UDP Relay Server is Running!");
+app.MapGet("/", () => "High-Performance Instant-Burst UDP Relay Server is Running!");
 
 app.MapGet("/stats", () =>
 {
@@ -82,7 +82,7 @@ app.Map("/relay", async context =>
     const int MAX_WORKERS = 100;
     int targetUdpWorkers = MIN_WORKERS;
 
-    // 1. Чтение UDP от Discord
+    // 1. Прием UDP от Discord
     var udpReceiveTask = Task.Run(async () =>
     {
         var remoteEp = new IPEndPoint(IPAddress.Any, 0);
@@ -92,7 +92,6 @@ app.Map("/relay", async context =>
             try
             {
                 var result = await udpClient.Client.ReceiveFromAsync(new ArraySegment<byte>(buffer, 6, 65530), SocketFlags.None, remoteEp);
-                long arrivalTimestamp = Stopwatch.GetTimestamp();
                 var ep = (IPEndPoint)result.RemoteEndPoint;
 
                 var ipBytes = ep.Address.MapToIPv4().GetAddressBytes();
@@ -108,7 +107,7 @@ app.Map("/relay", async context =>
                 int totalLen = 6 + result.ReceivedBytes;
                 Interlocked.Increment(ref ServerMetrics.TotalPacketsIn);
 
-                if (!toWsChannel.Writer.TryWrite(new RentedPacket(buffer, totalLen, null, arrivalTimestamp)))
+                if (!toWsChannel.Writer.TryWrite(new RentedPacket(buffer, totalLen, null)))
                 {
                     ArrayPool<byte>.Shared.Return(buffer);
                 }
@@ -118,7 +117,7 @@ app.Map("/relay", async context =>
         }
     });
 
-    // 2. Отправка в WebSocket с Fast-Path для пакетов подключения (< 120 байт)
+    // 2. Сбор в пачки на отправке в WebSocket
     var wsSendTask = Task.Run(async () =>
     {
         var reader = toWsChannel.Reader;
@@ -139,11 +138,9 @@ app.Map("/relay", async context =>
                 packetList.Add(firstPacket);
 
                 int batchDelay = Volatile.Read(ref currentBatchDelayMs);
+                bool isHandshake = firstPacket.Length <= 120;
 
-                // Fast-Path: если пакет одиночный или служебный (<120 байт, IP Discovery) — шлем мгновенно без задержек!
-                bool isHandshakePacket = firstPacket.Length <= 120;
-
-                if (batchDelay > 0 && !isHandshakePacket)
+                if (batchDelay > 0 && !isHandshake)
                 {
                     var sw = Stopwatch.StartNew();
                     while (packetList.Count < 32 && sw.ElapsedMilliseconds < batchDelay)
@@ -151,7 +148,7 @@ app.Map("/relay", async context =>
                         if (reader.TryRead(out var nextPacket))
                         {
                             packetList.Add(nextPacket);
-                            if (nextPacket.Length <= 120) break; // Служебный пакет — сразу закрываем пачку и шлем
+                            if (nextPacket.Length <= 120) break;
                         }
                         else
                         {
@@ -168,35 +165,15 @@ app.Map("/relay", async context =>
                 }
 
                 int totalBatchLen = 0;
-                long freq = Stopwatch.Frequency;
-
-                for (int i = 0; i < packetList.Count; i++)
+                foreach (var p in packetList)
                 {
-                    var p = packetList[i];
-                    uint deltaUs = 0;
-
-                    if (i > 0 && !isHandshakePacket)
-                    {
-                        long elapsedTicks = p.ArrivalTimestamp - packetList[i - 1].ArrivalTimestamp;
-                        if (elapsedTicks > 0)
-                        {
-                            deltaUs = (uint)Math.Clamp((elapsedTicks * 1_000_000) / freq, 0, 500_000);
-                        }
-                    }
-
-                    ushort subPacketLen = (ushort)(4 + p.Length);
-                    if (totalBatchLen + 2 + subPacketLen > batchBuffer.Length)
+                    ushort pLen = (ushort)p.Length;
+                    if (totalBatchLen + 2 + pLen > batchBuffer.Length)
                         break;
 
-                    batchBuffer[totalBatchLen] = (byte)(subPacketLen >> 8);
-                    batchBuffer[totalBatchLen + 1] = (byte)(subPacketLen & 0xFF);
+                    batchBuffer[totalBatchLen] = (byte)(pLen >> 8);
+                    batchBuffer[totalBatchLen + 1] = (byte)(pLen & 0xFF);
                     totalBatchLen += 2;
-
-                    batchBuffer[totalBatchLen] = (byte)(deltaUs >> 24);
-                    batchBuffer[totalBatchLen + 1] = (byte)((deltaUs >> 16) & 0xFF);
-                    batchBuffer[totalBatchLen + 2] = (byte)((deltaUs >> 8) & 0xFF);
-                    batchBuffer[totalBatchLen + 3] = (byte)(deltaUs & 0xFF);
-                    totalBatchLen += 4;
 
                     Buffer.BlockCopy(p.Buffer, 0, batchBuffer, totalBatchLen, p.Length);
                     totalBatchLen += p.Length;
@@ -245,7 +222,7 @@ app.Map("/relay", async context =>
                     continue;
                 }
 
-                if (result.MessageType == WebSocketMessageType.Binary && result.Count >= 12)
+                if (result.MessageType == WebSocketMessageType.Binary && result.Count >= 8)
                 {
                     int offset = 0;
                     while (offset + 2 <= result.Count)
@@ -253,25 +230,19 @@ app.Map("/relay", async context =>
                         ushort pLen = (ushort)((buffer[offset] << 8) | buffer[offset + 1]);
                         offset += 2;
 
-                        if (pLen < 10 || offset + pLen > result.Count)
+                        if (pLen < 6 || offset + pLen > result.Count)
                             break;
 
-                        uint deltaUs = (uint)((buffer[offset] << 24) |
-                                              (buffer[offset + 1] << 16) |
-                                              (buffer[offset + 2] << 8) |
-                                              buffer[offset + 3]);
-
-                        var targetIp = new IPAddress(buffer.AsSpan(offset + 4, 4));
-                        var targetPort = (ushort)((buffer[offset + 8] << 8) | buffer[offset + 9]);
+                        var targetIp = new IPAddress(buffer.AsSpan(offset, 4));
+                        var targetPort = (ushort)((buffer[offset + 4] << 8) | buffer[offset + 5]);
                         var ep = new IPEndPoint(targetIp, targetPort);
 
-                        int dataLen = pLen - 4;
-                        byte[] subBuffer = ArrayPool<byte>.Shared.Rent(dataLen);
-                        Buffer.BlockCopy(buffer, offset + 4, subBuffer, 0, dataLen);
+                        byte[] subBuffer = ArrayPool<byte>.Shared.Rent(pLen);
+                        Buffer.BlockCopy(buffer, offset, subBuffer, 0, pLen);
 
                         Interlocked.Increment(ref ServerMetrics.TotalPacketsOut);
 
-                        if (!toUdpChannel.Writer.TryWrite(new RentedPacket(subBuffer, dataLen, ep, 0, deltaUs)))
+                        if (!toUdpChannel.Writer.TryWrite(new RentedPacket(subBuffer, pLen, ep)))
                         {
                             ArrayPool<byte>.Shared.Return(subBuffer);
                         }
@@ -286,7 +257,7 @@ app.Map("/relay", async context =>
         }
     });
 
-    // 4. Отправка UDP в Discord
+    // 4. Мгновенная отправка UDP в Discord без задержек
     async Task RunUdpWorkerAsync(int workerId)
     {
         Interlocked.Increment(ref ServerMetrics.TotalActiveWorkers);
@@ -307,12 +278,6 @@ app.Map("/relay", async context =>
                     {
                         if (packet.EndPoint != null && !cts.IsCancellationRequested)
                         {
-                            // Пейсинг воспроизводится только для основного потока данных (не для служебных пакетов подключения)
-                            if (packet.DeltaMicroseconds > 0 && packet.Length > 120)
-                            {
-                                await PreciseDelayAsync(packet.DeltaMicroseconds, cts.Token);
-                            }
-
                             var data = new ReadOnlyMemory<byte>(packet.Buffer, 6, packet.Length - 6);
                             await udpClient.SendAsync(data, packet.EndPoint, cts.Token);
                         }
@@ -340,7 +305,7 @@ app.Map("/relay", async context =>
         _ = Task.Run(() => RunUdpWorkerAsync(id));
     }
 
-    // 5. Супервизор нагрузки
+    // 5. Супервизор CPU
     var supervisorTask = Task.Run(async () =>
     {
         while (!cts.IsCancellationRequested)
@@ -404,45 +369,17 @@ app.Map("/relay", async context =>
 
 app.Run();
 
-static async Task PreciseDelayAsync(uint microseconds, CancellationToken token)
-{
-    if (microseconds == 0) return;
-    microseconds = Math.Min(microseconds, 500_000);
-
-    long freq = Stopwatch.Frequency;
-    long targetTicks = Stopwatch.GetTimestamp() + (long)(microseconds * (double)freq / 1_000_000.0);
-
-    if (microseconds >= 2000)
-    {
-        int msToWait = (int)(microseconds / 1000) - 1;
-        if (msToWait > 0)
-        {
-            await Task.Delay(msToWait, token).ConfigureAwait(false);
-        }
-    }
-
-    while (Stopwatch.GetTimestamp() < targetTicks)
-    {
-        if (token.IsCancellationRequested) break;
-        Thread.SpinWait(10);
-    }
-}
-
 public readonly struct RentedPacket
 {
     public readonly byte[] Buffer;
     public readonly int Length;
     public readonly IPEndPoint? EndPoint;
-    public readonly long ArrivalTimestamp;
-    public readonly uint DeltaMicroseconds;
 
-    public RentedPacket(byte[] buffer, int length, IPEndPoint? endPoint, long arrivalTimestamp = 0, uint deltaMicroseconds = 0)
+    public RentedPacket(byte[] buffer, int length, IPEndPoint? endPoint)
     {
         Buffer = buffer;
         Length = length;
         EndPoint = endPoint;
-        ArrivalTimestamp = arrivalTimestamp;
-        DeltaMicroseconds = deltaMicroseconds;
     }
 }
 
