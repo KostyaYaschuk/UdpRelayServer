@@ -4,7 +4,6 @@ using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Text;
-using System.Text.Json.Nodes;
 using System.Threading.Channels;
 
 var builder = WebApplication.CreateSlimBuilder(args);
@@ -21,9 +20,8 @@ app.UseWebSockets(new WebSocketOptions
 
 const string SECRET_KEY = "my_super_secret_discord_key";
 
-app.MapGet("/", () => "High-Performance Microsecond-Paced UDP Relay Server is Running!");
+app.MapGet("/", () => "High-Performance Zero-Jitter UDP Relay Server is Running!");
 
-// Эндпоинт метрик для веб-панели управления
 app.MapGet("/stats", () =>
 {
     var uptime = DateTime.UtcNow - ServerMetrics.StartTime;
@@ -84,7 +82,7 @@ app.Map("/relay", async context =>
     const int MAX_WORKERS = 100;
     int targetUdpWorkers = MIN_WORKERS;
 
-    // 1. Прием UDP от Discord с фиксацией аппаратного времени прихода
+    // 1. Чтение UDP от Discord
     var udpReceiveTask = Task.Run(async () =>
     {
         var remoteEp = new IPEndPoint(IPAddress.Any, 0);
@@ -120,7 +118,7 @@ app.Map("/relay", async context =>
         }
     });
 
-    // 2. Пакетирование пачками с кодированием дельты задержки в микросекундах (4 байта uint32)
+    // 2. Отправка в WebSocket с Fast-Path для пакетов подключения (< 120 байт)
     var wsSendTask = Task.Run(async () =>
     {
         var reader = toWsChannel.Reader;
@@ -135,18 +133,17 @@ app.Map("/relay", async context =>
 
                 packetList.Clear();
 
-                if (reader.TryRead(out var firstPacket))
-                {
-                    packetList.Add(firstPacket);
-                }
-                else
-                {
+                if (!reader.TryRead(out var firstPacket))
                     continue;
-                }
+
+                packetList.Add(firstPacket);
 
                 int batchDelay = Volatile.Read(ref currentBatchDelayMs);
 
-                if (batchDelay > 0)
+                // Fast-Path: если пакет одиночный или служебный (<120 байт, IP Discovery) — шлем мгновенно без задержек!
+                bool isHandshakePacket = firstPacket.Length <= 120;
+
+                if (batchDelay > 0 && !isHandshakePacket)
                 {
                     var sw = Stopwatch.StartNew();
                     while (packetList.Count < 32 && sw.ElapsedMilliseconds < batchDelay)
@@ -154,6 +151,7 @@ app.Map("/relay", async context =>
                         if (reader.TryRead(out var nextPacket))
                         {
                             packetList.Add(nextPacket);
+                            if (nextPacket.Length <= 120) break; // Служебный пакет — сразу закрываем пачку и шлем
                         }
                         else
                         {
@@ -169,7 +167,6 @@ app.Map("/relay", async context =>
                     }
                 }
 
-                // Упаковка пакетов: [2B длина][4B DeltaUs][6B IP+Port][UDP Data]
                 int totalBatchLen = 0;
                 long freq = Stopwatch.Frequency;
 
@@ -178,7 +175,7 @@ app.Map("/relay", async context =>
                     var p = packetList[i];
                     uint deltaUs = 0;
 
-                    if (i > 0)
+                    if (i > 0 && !isHandshakePacket)
                     {
                         long elapsedTicks = p.ArrivalTimestamp - packetList[i - 1].ArrivalTimestamp;
                         if (elapsedTicks > 0)
@@ -187,31 +184,25 @@ app.Map("/relay", async context =>
                         }
                     }
 
-                    ushort subPacketLen = (ushort)(4 + p.Length); // 4 байта DeltaUs + p.Length (IP:4 + Port:2 + Data)
+                    ushort subPacketLen = (ushort)(4 + p.Length);
                     if (totalBatchLen + 2 + subPacketLen > batchBuffer.Length)
                         break;
 
-                    // 1. Длина подпакета (2 байта)
                     batchBuffer[totalBatchLen] = (byte)(subPacketLen >> 8);
                     batchBuffer[totalBatchLen + 1] = (byte)(subPacketLen & 0xFF);
                     totalBatchLen += 2;
 
-                    // 2. Дельта времени в микросекундах (4 байта big-endian)
                     batchBuffer[totalBatchLen] = (byte)(deltaUs >> 24);
                     batchBuffer[totalBatchLen + 1] = (byte)((deltaUs >> 16) & 0xFF);
                     batchBuffer[totalBatchLen + 2] = (byte)((deltaUs >> 8) & 0xFF);
                     batchBuffer[totalBatchLen + 3] = (byte)(deltaUs & 0xFF);
                     totalBatchLen += 4;
 
-                    // 3. IP (4B) + Port (2B) + Payload
                     Buffer.BlockCopy(p.Buffer, 0, batchBuffer, totalBatchLen, p.Length);
                     totalBatchLen += p.Length;
                 }
 
-                foreach (var p in packetList)
-                {
-                    ArrayPool<byte>.Shared.Return(p.Buffer);
-                }
+                foreach (var p in packetList) ArrayPool<byte>.Shared.Return(p.Buffer);
 
                 if (totalBatchLen > 0 && webSocket.State == WebSocketState.Open && !cts.IsCancellationRequested)
                 {
@@ -227,7 +218,7 @@ app.Map("/relay", async context =>
         }
     });
 
-    // 3. Прием WebSocket-пачек и декодирование микросекундных таймингов
+    // 3. Прием из WebSocket
     var wsReceiveTask = Task.Run(async () =>
     {
         while (!cts.IsCancellationRequested && webSocket.State == WebSocketState.Open)
@@ -254,7 +245,6 @@ app.Map("/relay", async context =>
                     continue;
                 }
 
-                // Парсинг пачки: [2B subPacketLen][4B DeltaUs][4B IP][2B Port][UDP Data]
                 if (result.MessageType == WebSocketMessageType.Binary && result.Count >= 12)
                 {
                     int offset = 0;
@@ -275,7 +265,7 @@ app.Map("/relay", async context =>
                         var targetPort = (ushort)((buffer[offset + 8] << 8) | buffer[offset + 9]);
                         var ep = new IPEndPoint(targetIp, targetPort);
 
-                        int dataLen = pLen - 4; // IP (4B) + Port (2B) + Payload
+                        int dataLen = pLen - 4;
                         byte[] subBuffer = ArrayPool<byte>.Shared.Rent(dataLen);
                         Buffer.BlockCopy(buffer, offset + 4, subBuffer, 0, dataLen);
 
@@ -296,7 +286,7 @@ app.Map("/relay", async context =>
         }
     });
 
-    // 4. Параллельный UDP воркер с микросекундным пейсингом
+    // 4. Отправка UDP в Discord
     async Task RunUdpWorkerAsync(int workerId)
     {
         Interlocked.Increment(ref ServerMetrics.TotalActiveWorkers);
@@ -317,8 +307,8 @@ app.Map("/relay", async context =>
                     {
                         if (packet.EndPoint != null && !cts.IsCancellationRequested)
                         {
-                            // Воспроизведение интервала прихода пакета с точностью до микросекунды
-                            if (packet.DeltaMicroseconds > 0)
+                            // Пейсинг воспроизводится только для основного потока данных (не для служебных пакетов подключения)
+                            if (packet.DeltaMicroseconds > 0 && packet.Length > 120)
                             {
                                 await PreciseDelayAsync(packet.DeltaMicroseconds, cts.Token);
                             }
@@ -350,7 +340,7 @@ app.Map("/relay", async context =>
         _ = Task.Run(() => RunUdpWorkerAsync(id));
     }
 
-    // 5. Адаптивный супервизор (до 100 воркеров при CPU < 80%)
+    // 5. Супервизор нагрузки
     var supervisorTask = Task.Run(async () =>
     {
         while (!cts.IsCancellationRequested)
@@ -367,8 +357,7 @@ app.Map("/relay", async context =>
                 {
                     if (currentLimit > MIN_WORKERS)
                     {
-                        int newLimit = Math.Max(MIN_WORKERS, currentLimit - 5);
-                        Volatile.Write(ref targetUdpWorkers, newLimit);
+                        Volatile.Write(ref targetUdpWorkers, Math.Max(MIN_WORKERS, currentLimit - 5));
                     }
                 }
                 else if (currentCpu < 75.0 && queueCount > 0)
@@ -409,21 +398,16 @@ app.Map("/relay", async context =>
 
     if (webSocket.State == WebSocketState.Open)
     {
-        try
-        {
-            await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closed", CancellationToken.None);
-        }
-        catch { }
+        try { await webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closed", CancellationToken.None); } catch { }
     }
 });
 
 app.Run();
 
-// Высокоточный аппаратный таймер микросекундных задержек
 static async Task PreciseDelayAsync(uint microseconds, CancellationToken token)
 {
     if (microseconds == 0) return;
-    microseconds = Math.Min(microseconds, 500_000); // Защита от зависаний (макс 500 мс)
+    microseconds = Math.Min(microseconds, 500_000);
 
     long freq = Stopwatch.Frequency;
     long targetTicks = Stopwatch.GetTimestamp() + (long)(microseconds * (double)freq / 1_000_000.0);
