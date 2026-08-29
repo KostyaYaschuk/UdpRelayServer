@@ -19,7 +19,7 @@ app.UseWebSockets(new WebSocketOptions
 
 const string SECRET_KEY = "my_super_secret_discord_key";
 
-app.MapGet("/", () => "High-Performance Zero-Latency UDP Relay Server is Running!");
+app.MapGet("/", () => "High-Performance Full Hybrid TCP+UDP Relay Server is Running!");
 
 app.MapGet("/stats", () =>
 {
@@ -36,6 +36,90 @@ app.MapGet("/stats", () =>
     });
 });
 
+// 🌐 1. ЭНДПОИНТ ДЛЯ БРАУЗЕРОВ И САЙТОВ (TCP: Chrome, 2ip.io, HTTPS, Discord API)
+app.Map("/tcp", async context =>
+{
+    if (!context.WebSockets.IsWebSocketRequest)
+    {
+        context.Response.StatusCode = 400;
+        return;
+    }
+
+    if (context.Request.Headers["X-Auth-Key"] != SECRET_KEY && 
+        context.Request.Query["key"] != SECRET_KEY)
+    {
+        context.Response.StatusCode = 401;
+        return;
+    }
+
+    string host = context.Request.Query["host"].ToString();
+    if (!int.TryParse(context.Request.Query["port"], out int targetPort))
+    {
+        context.Response.StatusCode = 400;
+        return;
+    }
+
+    using var ws = await context.WebSockets.AcceptWebSocketAsync();
+    using var tcp = new TcpClient { NoDelay = true };
+
+    try
+    {
+        await tcp.ConnectAsync(host, targetPort);
+        using var stream = tcp.GetStream();
+        using var cts = new CancellationTokenSource();
+
+        var wsToTcp = Task.Run(async () =>
+        {
+            var buf = ArrayPool<byte>.Shared.Rent(65536);
+            try
+            {
+                while (ws.State == WebSocketState.Open && !cts.IsCancellationRequested)
+                {
+                    var res = await ws.ReceiveAsync(new ArraySegment<byte>(buf), cts.Token);
+                    if (res.MessageType == WebSocketMessageType.Close) break;
+                    if (res.Count > 0)
+                    {
+                        await stream.WriteAsync(new ReadOnlyMemory<byte>(buf, 0, res.Count), cts.Token);
+                    }
+                }
+            }
+            catch { }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buf);
+                cts.Cancel();
+            }
+        });
+
+        var tcpToWs = Task.Run(async () =>
+        {
+            var buf = ArrayPool<byte>.Shared.Rent(65536);
+            try
+            {
+                while (tcp.Connected && !cts.IsCancellationRequested)
+                {
+                    int read = await stream.ReadAsync(new Memory<byte>(buf), cts.Token);
+                    if (read <= 0) break;
+                    if (ws.State == WebSocketState.Open)
+                    {
+                        await ws.SendAsync(new ReadOnlyMemory<byte>(buf, 0, read), WebSocketMessageType.Binary, true, cts.Token);
+                    }
+                }
+            }
+            catch { }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buf);
+                cts.Cancel();
+            }
+        });
+
+        await Task.WhenAny(wsToTcp, tcpToWs);
+    }
+    catch { }
+});
+
+// 🎧 2. ЭНДПОИНТ ДЛЯ ГОЛОСА И ИГР (UDP: Discord Voice, Warframe 4955, Valorant)
 app.Map("/relay", async context =>
 {
     if (!context.WebSockets.IsWebSocketRequest)
@@ -68,7 +152,6 @@ app.Map("/relay", async context =>
     var toWsChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
     var toUdpChannel = Channel.CreateUnbounded<RentedPacket>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
 
-    // 1. Прием входящих UDP от Discord -> мгновенно в WebSocket Channel
     var udpReceiveTask = Task.Run(async () =>
     {
         var remoteEp = new IPEndPoint(IPAddress.Any, 0);
@@ -103,7 +186,6 @@ app.Map("/relay", async context =>
         }
     });
 
-    // 2. Мгновенная отправка в WebSocket клиенту без задержек
     var wsSendTask = Task.Run(async () =>
     {
         var reader = toWsChannel.Reader;
@@ -131,7 +213,6 @@ app.Map("/relay", async context =>
         catch { }
     });
 
-    // 3. Прием из WebSocket от клиента
     var wsReceiveTask = Task.Run(async () =>
     {
         while (!cts.IsCancellationRequested && webSocket.State == WebSocketState.Open)
@@ -142,10 +223,7 @@ app.Map("/relay", async context =>
                 var result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), cts.Token);
 
                 if (result.MessageType == WebSocketMessageType.Close)
-                {
-                    ArrayPool<byte>.Shared.Return(buffer);
                     break;
-                }
 
                 if (result.MessageType == WebSocketMessageType.Binary && result.Count > 6)
                 {
@@ -169,7 +247,6 @@ app.Map("/relay", async context =>
         }
     });
 
-    // 4. Мгновенная отправка UDP в Discord
     var udpSendTask = Task.Run(async () =>
     {
         var reader = toUdpChannel.Reader;
